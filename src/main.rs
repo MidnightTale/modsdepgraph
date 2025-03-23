@@ -5,6 +5,7 @@ use egui::{Color32, Key, Rect, Sense, Stroke, Vec2, pos2, Pos2};
 use eframe::epaint::TextureHandle;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -76,6 +77,8 @@ struct Dependency {
     #[serde(rename = "versionRange", default)]
     #[allow(dead_code)]
     version_range: String,
+    #[serde(rename = "side", default)]
+    side: Option<String>,
 }
 
 // Fabric mod structure
@@ -96,6 +99,8 @@ struct FabricMod {
     breaks: HashMap<String, String>,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
 }
 
 #[derive(Debug)]
@@ -104,7 +109,7 @@ enum ModFormat {
     Fabric(FabricMod),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ModIcon {
     mod_id: String,
     image_data: Vec<u8>,
@@ -126,6 +131,7 @@ struct Edge {
     to: NodeIndex,
     label: String,
     color: Color32,
+    side: Option<String>,
 }
 
 struct AppData {
@@ -267,11 +273,21 @@ impl ModDepGraphApp {
                 let dep_type = edge.weight();
                 let color = self.get_edge_color(dep_type);
                 
+                // Extract side information
+                let side = if dep_type.contains("CLIENT") {
+                    Some("CLIENT".to_string())
+                } else if dep_type.contains("SERVER") {
+                    Some("SERVER".to_string())
+                } else {
+                    None
+                };
+                
                 self.data.edges.push(Edge {
                     from: edge.source(),
                     to: edge.target(),
                     label: edge.weight().clone(),
                     color,
+                    side,
                 });
             }
 
@@ -426,17 +442,41 @@ impl ModDepGraphApp {
             let mut dependents = Vec::new();
             
             for edge in graph.edges_directed(node.id, petgraph::Direction::Outgoing) {
-                dependencies.push(format!("{} → {} ({})", 
+                let side_info = if let Some(edge_idx) = self.data.edges.iter().position(|e| 
+                    e.from == edge.source() && e.to == edge.target()) {
+                    if let Some(side) = &self.data.edges[edge_idx].side {
+                        format!(" [{}]", side)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                
+                dependencies.push(format!("{} → {} ({}{})", 
                     graph[edge.source()], 
                     graph[edge.target()], 
-                    edge.weight()));
+                    edge.weight(),
+                    side_info));
             }
             
             for edge in graph.edges_directed(node.id, petgraph::Direction::Incoming) {
-                dependents.push(format!("{} → {} ({})", 
+                let side_info = if let Some(edge_idx) = self.data.edges.iter().position(|e| 
+                    e.from == edge.source() && e.to == edge.target()) {
+                    if let Some(side) = &self.data.edges[edge_idx].side {
+                        format!(" [{}]", side)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                
+                dependents.push(format!("{} → {} ({}{})", 
                     graph[edge.source()], 
                     graph[edge.target()], 
-                    edge.weight()));
+                    edge.weight(),
+                    side_info));
             }
             
             let mut info = String::new();
@@ -494,47 +534,67 @@ impl ModDepGraphApp {
     }
 
     fn load_icons(&mut self, ctx: &egui::Context) {
-        for icon in &self.data.icon_data {
-            if self.data.icons.contains_key(&icon.mod_id) {
-                continue;  // Already loaded
-            }
-            
-            // Try to load the icon
-            if let Ok(image) = load_image_from_memory(&icon.image_data) {
-                println!("Loading icon for mod_id: {}", icon.mod_id);
+        let icons_to_load: Vec<ModIcon> = self.data.icon_data.iter()
+            .filter(|icon| !self.data.icons.contains_key(&icon.mod_id))
+            .cloned()
+            .collect();
+        
+        if icons_to_load.is_empty() {
+            return;
+        }
+        
+        println!("Loading {} icons in parallel", icons_to_load.len());
+        
+        // Process icons in parallel using rayon
+        let processed_icons: Vec<(String, Option<(Vec<u8>, [usize; 2])>)> = icons_to_load.par_iter()
+            .map(|icon| {
+                let mod_id = icon.mod_id.clone();
+                let result = load_image_from_memory(&icon.image_data)
+                    .map(|image| {
+                        // Resize the image to a reasonable size
+                        let max_size = 256;
+                        let image = if image.width() > max_size || image.height() > max_size {
+                            let width = image.width();
+                            let height = image.height();
+                            let aspect_ratio = width as f32 / height as f32;
+                            
+                            let (new_width, new_height) = if width > height {
+                                (max_size, (max_size as f32 / aspect_ratio) as u32)
+                            } else {
+                                ((max_size as f32 * aspect_ratio) as u32, max_size)
+                            };
+                            
+                            image.resize_exact(new_width, new_height, image::imageops::FilterType::Lanczos3)
+                        } else {
+                            image
+                        };
+                        
+                        let size = [image.width() as usize, image.height() as usize];
+                        let image_buffer = image.to_rgba8();
+                        let pixels = image_buffer.as_flat_samples();
+                        
+                        (pixels.as_slice().to_vec(), size)
+                    })
+                    .ok();
                 
-                // Resize the image to a reasonable size
-                let max_size = 256;
-                let image = if image.width() > max_size || image.height() > max_size {
-                    let width = image.width();
-                    let height = image.height();
-                    let aspect_ratio = width as f32 / height as f32;
-                    
-                    let (new_width, new_height) = if width > height {
-                        (max_size, (max_size as f32 / aspect_ratio) as u32)
-                    } else {
-                        ((max_size as f32 * aspect_ratio) as u32, max_size)
-                    };
-                    
-                    image.resize_exact(new_width, new_height, image::imageops::FilterType::Lanczos3)
-                } else {
-                    image
-                };
-                
-                let size = [image.width() as usize, image.height() as usize];
-                let image_buffer = image.to_rgba8();
-                let pixels = image_buffer.as_flat_samples();
-                
+                (mod_id, result)
+            })
+            .collect();
+        
+        // Now create the textures in the main thread
+        for (mod_id, image_data) in processed_icons {
+            if let Some((pixels, size)) = image_data {
                 let texture = ctx.load_texture(
-                    &icon.mod_id,
+                    &mod_id,
                     egui::ColorImage::from_rgba_unmultiplied(
                         size,
-                        pixels.as_slice(),
+                        &pixels,
                     ),
                     egui::TextureOptions::default(),
                 );
                 
-                self.data.icons.insert(icon.mod_id.clone(), texture);
+                self.data.icons.insert(mod_id.clone(), texture);
+                println!("Loaded icon for mod_id: {}", mod_id);
             }
         }
         
@@ -917,9 +977,16 @@ impl eframe::App for ModDepGraphApp {
                         (start.y + end.y) * 0.5
                     );
                     
+                    // Include side info in the edge label if available
+                    let label_text = if let Some(side) = &edge.side {
+                        format!("{} [{}]", edge.label, side)
+                    } else {
+                        edge.label.clone()
+                    };
+                    
                     // Draw a small background for better readability
                     let text_size = egui::TextStyle::Body.resolve(ui.style()).size;
-                    let text_width = edge.label.len() as f32 * text_size * 0.6;
+                    let text_width = label_text.len() as f32 * text_size * 0.6;
                     let bg_rect = Rect::from_center_size(
                         mid_pos, 
                         Vec2::new(text_width, text_size * 1.2)
@@ -929,7 +996,7 @@ impl eframe::App for ModDepGraphApp {
                     painter.text(
                         mid_pos,
                         egui::Align2::CENTER_CENTER,
-                        &edge.label,
+                        &label_text,
                         egui::FontId::proportional(if highlight { 12.0 } else { 10.0 }),
                         Color32::WHITE,
                     );
@@ -1264,26 +1331,6 @@ fn extract_mod_info_and_icon(jar_path: &Path) -> Result<(Option<(String, ModForm
                 }
             }
         }
-        
-        if icon_data.is_none() {
-            println!("  - No icon found for mod: {}", mod_id);
-            
-            // Debug: list all image files in JAR
-            println!("  - Listing all image files in JAR:");
-            let image_files: Vec<&String> = all_file_names.iter()
-                .filter(|name| {
-                    name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg")
-                })
-                .collect();
-            
-            if image_files.len() <= 10 {
-                for file in &image_files {
-                    println!("    - {}", file);
-                }
-            } else {
-                println!("    - Found {} image files", image_files.len());
-            }
-        }
     }
     
     Ok((mod_format.map(|mf| (jar_name, mf)), icon_data))
@@ -1316,6 +1363,8 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
     let mut graph = DiGraph::new();
     let mut node_map = HashMap::new();
     let mut mod_id_to_jar = HashMap::new();
+    let mut mod_environments = HashMap::new();
+    let mut edge_info = Vec::new();
     
     // First pass: create nodes for each mod
     for (jar_name, mod_format) in mods {
@@ -1343,6 +1392,11 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
                 let node_idx = graph.add_node(display_name);
                 node_map.insert(fabric.id.clone(), node_idx);
                 mod_id_to_jar.insert(fabric.id.clone(), jar_name.clone());
+                
+                // Store environment info
+                if let Some(env) = &fabric.environment {
+                    mod_environments.insert(fabric.id.clone(), env.clone());
+                }
             }
         }
     }
@@ -1359,7 +1413,10 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
                         for dep in dependencies {
                             if let Some(to_idx) = node_map.get(&dep.mod_id) {
                                 let edge_label = format!("{}", dep.dependency_type);
-                                graph.add_edge(*from_idx, *to_idx, edge_label);
+                                let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                                
+                                // Store edge with side information
+                                edge_info.push((edge_idx, dep.side.clone()));
                             }
                         }
                     }
@@ -1367,38 +1424,76 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
             },
             ModFormat::Fabric(fabric) => {
                 if let Some(from_idx) = node_map.get(&fabric.id) {
+                    // Get environment for this mod
+                    let env = fabric.environment.as_ref().map(|e| e.as_str()).unwrap_or("*");
+                    
                     // Add required dependencies
                     for (dep_id, _) in &fabric.depends {
                         if let Some(to_idx) = node_map.get(dep_id) {
-                            graph.add_edge(*from_idx, *to_idx, "required".to_string());
+                            let edge_label = "required".to_string();
+                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                            
+                            // Get dependency environment
+                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                            let side = determine_side_from_environments(env, dep_env);
+                            
+                            edge_info.push((edge_idx, Some(side)));
                         }
                     }
                     
                     // Add recommended dependencies
                     for (dep_id, _) in &fabric.recommends {
                         if let Some(to_idx) = node_map.get(dep_id) {
-                            graph.add_edge(*from_idx, *to_idx, "recommends".to_string());
+                            let edge_label = "recommends".to_string();
+                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                            
+                            // Get dependency environment
+                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                            let side = determine_side_from_environments(env, dep_env);
+                            
+                            edge_info.push((edge_idx, Some(side)));
                         }
                     }
                     
                     // Add optional dependencies
                     for (dep_id, _) in &fabric.suggests {
                         if let Some(to_idx) = node_map.get(dep_id) {
-                            graph.add_edge(*from_idx, *to_idx, "suggests".to_string());
+                            let edge_label = "suggests".to_string();
+                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                            
+                            // Get dependency environment
+                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                            let side = determine_side_from_environments(env, dep_env);
+                            
+                            edge_info.push((edge_idx, Some(side)));
                         }
                     }
                     
                     // Add conflicts
                     for (dep_id, _) in &fabric.conflicts {
                         if let Some(to_idx) = node_map.get(dep_id) {
-                            graph.add_edge(*from_idx, *to_idx, "conflicts".to_string());
+                            let edge_label = "conflicts".to_string();
+                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                            
+                            // Get dependency environment
+                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                            let side = determine_side_from_environments(env, dep_env);
+                            
+                            edge_info.push((edge_idx, Some(side)));
                         }
                     }
                     
                     // Add breaks
                     for (dep_id, _) in &fabric.breaks {
                         if let Some(to_idx) = node_map.get(dep_id) {
-                            graph.add_edge(*from_idx, *to_idx, "breaks".to_string());
+                            let edge_label = "breaks".to_string();
+                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
+                            
+                            // Get dependency environment
+                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                            let side = determine_side_from_environments(env, dep_env);
+                            
+                            edge_info.push((edge_idx, Some(side)));
                         }
                     }
                 }
@@ -1406,7 +1501,7 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
         }
     }
     
-    println!("Added {} edges in graph", graph.edge_count());
+    println!("Added {} edges in graph with {} edge info entries", graph.edge_count(), edge_info.len());
     
     // If no edges were found, add all nodes as isolated nodes
     if graph.edge_count() == 0 && graph.node_count() > 0 {
@@ -1414,6 +1509,17 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
     }
     
     Ok(graph)
+}
+
+// Helper function to determine side from environment settings
+fn determine_side_from_environments(mod_env: &str, dep_env: &str) -> String {
+    match (mod_env, dep_env) {
+        ("client", _) => "CLIENT".to_string(),
+        (_, "client") => "CLIENT".to_string(),
+        ("server", _) => "SERVER".to_string(),
+        (_, "server") => "SERVER".to_string(),
+        _ => "BOTH".to_string(),
+    }
 }
 
 fn load_image_from_memory(image_data: &[u8]) -> Result<DynamicImage> {
