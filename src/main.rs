@@ -11,11 +11,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{mpsc::{channel, Receiver, Sender}, Mutex, Arc};
 use std::thread;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 use image::DynamicImage;
+use num_cpus;
 
 fn normalize_vec(v: Vec2) -> Vec2 {
     let length = v.length();
@@ -140,7 +141,7 @@ struct AppData {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     status: String,
-    rx: Receiver<AppMessage>,
+    rx: Arc<Mutex<Receiver<AppMessage>>>,
     loaded: bool,
     mod_info: Option<(String, String)>,
     selected_node: Option<NodeIndex>,
@@ -171,18 +172,32 @@ struct ModDepGraphApp {
 }
 
 impl ModDepGraphApp {
-    fn new(cc: &eframe::CreationContext<'_>, mods_path: PathBuf) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, mods_path: PathBuf) -> Self {
         // Set up channel for background thread communication
         let (tx, rx) = channel();
+        let tx_clone = tx.clone();
+        let rx = Arc::new(Mutex::new(rx));
         
         // Spawn background thread to load mods
         thread::spawn(move || {
-            match scan_mods(&mods_path, tx.clone()) {
+            tx_clone.send(AppMessage::Progress("Starting mod scan...".to_string())).unwrap();
+            
+            match scan_mods(&mods_path, tx_clone.clone()) {
                 Ok((mods, icons)) => {
-                    tx.send(AppMessage::ModsLoaded(mods, icons)).unwrap();
+                    tx_clone.send(AppMessage::Progress("Generating graph...".to_string())).unwrap();
+                    
+                    // Process mod data in parallel batches for better performance
+                    match generate_dependency_graph(&mods) {
+                        Ok(_) => {
+                            tx_clone.send(AppMessage::ModsLoaded(mods, icons)).unwrap();
+                        }
+                        Err(e) => {
+                            tx_clone.send(AppMessage::Error(format!("Error generating graph: {}", e))).unwrap();
+                        }
+                    }
                 }
                 Err(e) => {
-                    tx.send(AppMessage::Error(format!("Error scanning mods: {}", e))).unwrap();
+                    tx_clone.send(AppMessage::Error(format!("Error scanning mods: {}", e))).unwrap();
                 }
             }
         });
@@ -212,21 +227,28 @@ impl ModDepGraphApp {
         }
     }
     
+    // Add parallel search function
     fn update_matched_mods(&mut self) {
-        self.data.matched_mods.clear();
-        
         if self.data.search_text.is_empty() {
+            self.data.matched_mods.clear();
             return;
         }
         
         let search_lower = self.data.search_text.to_lowercase();
+        
         if let Some(graph) = &self.data.graph {
-            for idx in graph.node_indices() {
-                let node_label = &graph[idx];
-                if node_label.to_lowercase().contains(&search_lower) {
-                    self.data.matched_mods.push(node_label.clone());
-                }
-            }
+            let matched: Vec<String> = graph.node_indices().par_bridge()
+                .filter_map(|idx| {
+                    let node_label = &graph[idx];
+                    if node_label.to_lowercase().contains(&search_lower) {
+                        Some(node_label.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            self.data.matched_mods = matched;
         }
     }
     
@@ -235,61 +257,65 @@ impl ModDepGraphApp {
             // Generate nodes
             self.data.nodes.clear();
             
-            // Initial layout - use a spiral to avoid exact overlaps from the start
-            let node_count = graph.node_count() as f32;
+            // Create nodes in parallel
+            let node_count = graph.node_count();
             let max_radius = 400.0;  // Larger initial radius to spread nodes more
             
-            for (i, idx) in graph.node_indices().enumerate() {
-                let node_label = &graph[idx];
-                
-                // Use a spiral layout for initial positions
-                let angle = 2.0 * std::f32::consts::PI * (i as f32) / 20.0;  // More spacing between angles
-                let distance_factor = (i as f32) / node_count;
-                let distance = max_radius * (0.2 + 0.8 * distance_factor);  // Start from 20% radius
-                
-                let x = distance * angle.cos();
-                let y = distance * angle.sin();
-                
-                // Set colors based on mod type
-                let color = self.get_node_color_for_mod_id(&node_label);
-                
-                // Look for mod icon
-                let texture = None; // We'll load textures in the update method
-                
-                self.data.nodes.push(Node {
-                    id: idx,
-                    label: node_label.clone(),
-                    pos: pos2(x, y),
-                    radius: 25.0, // Larger radius for icons
-                    color,
-                    texture,
-                });
-            }
+            let nodes: Vec<Node> = graph.node_indices().enumerate().par_bridge()
+                .map(|(i, idx)| {
+                    let node_label = &graph[idx];
+                    
+                    // Use a spiral layout for initial positions
+                    let angle = 2.0 * std::f32::consts::PI * (i as f32) / 20.0;  // More spacing between angles
+                    let distance_factor = (i as f32) / (node_count as f32);
+                    let distance = max_radius * (0.2 + 0.8 * distance_factor);  // Start from 20% radius
+                    
+                    let x = distance * angle.cos();
+                    let y = distance * angle.sin();
+                    
+                    // Set colors based on mod type
+                    let color = self.get_node_color_for_mod_id(&node_label);
+                    
+                    Node {
+                        id: idx,
+                        label: node_label.clone(),
+                        pos: pos2(x, y),
+                        radius: 25.0, // Larger radius for icons
+                        color,
+                        texture: None, // We'll load textures in the update method
+                    }
+                })
+                .collect();
             
-            // Generate edges
-            self.data.edges.clear();
-            for edge in graph.edge_references() {
-                // Determine color based on dependency type
-                let dep_type = edge.weight();
-                let color = self.get_edge_color(dep_type);
-                
-                // Extract side information
-                let side = if dep_type.contains("CLIENT") {
-                    Some("CLIENT".to_string())
-                } else if dep_type.contains("SERVER") {
-                    Some("SERVER".to_string())
-                } else {
-                    None
-                };
-                
-                self.data.edges.push(Edge {
-                    from: edge.source(),
-                    to: edge.target(),
-                    label: edge.weight().clone(),
-                    color,
-                    side,
-                });
-            }
+            self.data.nodes = nodes;
+            
+            // Generate edges in parallel
+            let edges: Vec<Edge> = graph.edge_references().par_bridge()
+                .map(|edge| {
+                    // Determine color based on dependency type
+                    let dep_type = edge.weight();
+                    let color = self.get_edge_color(dep_type);
+                    
+                    // Extract side information
+                    let side = if dep_type.contains("CLIENT") {
+                        Some("CLIENT".to_string())
+                    } else if dep_type.contains("SERVER") {
+                        Some("SERVER".to_string())
+                    } else {
+                        None
+                    };
+                    
+                    Edge {
+                        from: edge.source(),
+                        to: edge.target(),
+                        label: edge.weight().clone(),
+                        color,
+                        side,
+                    }
+                })
+                .collect();
+            
+            self.data.edges = edges;
 
             // Apply force-directed layout to reduce overlap
             self.apply_force_directed_layout(100); // More iterations for better spacing
@@ -308,43 +334,45 @@ impl ModDepGraphApp {
         let mut velocities: Vec<Vec2> = vec![Vec2::ZERO; self.data.nodes.len()];
         
         for _ in 0..iterations {
-            // Calculate forces
-            let mut forces = vec![Vec2::ZERO; self.data.nodes.len()];
+            // Calculate forces in parallel
+            let nodes = &self.data.nodes;
+            let edges = &self.data.edges;
             
-            // Repulsive forces (nodes repel each other)
-            for i in 0..self.data.nodes.len() {
-                for j in 0..self.data.nodes.len() {
+            // Calculate repulsive forces in parallel
+            let repulsive_forces: Vec<Vec2> = (0..nodes.len()).into_par_iter().map(|i| {
+                let mut force = Vec2::ZERO;
+                
+                for j in 0..nodes.len() {
                     if i != j {
-                        let delta_x = self.data.nodes[i].pos.x - self.data.nodes[j].pos.x;
-                        let delta_y = self.data.nodes[i].pos.y - self.data.nodes[j].pos.y;
+                        let delta_x = nodes[i].pos.x - nodes[j].pos.x;
+                        let delta_y = nodes[i].pos.y - nodes[j].pos.y;
                         
                         let distance_sq = delta_x * delta_x + delta_y * delta_y;
                         let distance = distance_sq.sqrt().max(1.0); // Avoid division by zero
                         
                         // Stronger repulsion for closer nodes
-                        let force = if distance < 100.0 {
+                        let force_magnitude = if distance < 100.0 {
                             repulsion * 2.0 / distance_sq
                         } else {
                             repulsion / distance_sq
                         };
                         
-                        let force_x = force * delta_x / distance;
-                        let force_y = force * delta_y / distance;
-                        
-                        forces[i].x += force_x;
-                        forces[i].y += force_y;
+                        force.x += force_magnitude * delta_x / distance;
+                        force.y += force_magnitude * delta_y / distance;
                     }
                 }
-            }
+                
+                force
+            }).collect();
             
-            // Attractive forces (edges pull connected nodes together)
-            for edge in &self.data.edges {
-                if let (Some(from_idx), Some(to_idx)) = (
-                    self.data.nodes.iter().position(|n| n.id == edge.from),
-                    self.data.nodes.iter().position(|n| n.id == edge.to),
-                ) {
-                    let delta_x = self.data.nodes[from_idx].pos.x - self.data.nodes[to_idx].pos.x;
-                    let delta_y = self.data.nodes[from_idx].pos.y - self.data.nodes[to_idx].pos.y;
+            // Calculate attractive forces in parallel
+            let attractive_forces: Vec<(usize, Vec2)> = edges.par_iter()
+                .filter_map(|edge| {
+                    let from_idx = nodes.iter().position(|n| n.id == edge.from)?;
+                    let to_idx = nodes.iter().position(|n| n.id == edge.to)?;
+                    
+                    let delta_x = nodes[from_idx].pos.x - nodes[to_idx].pos.x;
+                    let delta_y = nodes[from_idx].pos.y - nodes[to_idx].pos.y;
                     
                     let distance = (delta_x * delta_x + delta_y * delta_y).sqrt().max(1.0);
                     
@@ -352,16 +380,22 @@ impl ModDepGraphApp {
                     let force_x = force * delta_x / distance;
                     let force_y = force * delta_y / distance;
                     
-                    forces[from_idx].x -= force_x;
-                    forces[from_idx].y -= force_y;
-                    
-                    forces[to_idx].x += force_x;
-                    forces[to_idx].y += force_y;
-                }
+                    Some([(from_idx, Vec2::new(-force_x, -force_y)), 
+                          (to_idx, Vec2::new(force_x, force_y))])
+                })
+                .flatten()
+                .collect();
+            
+            // Combine forces
+            let mut forces = repulsive_forces;
+            
+            for (idx, force) in attractive_forces {
+                forces[idx].x += force.x;
+                forces[idx].y += force.y;
             }
             
             // Apply forces and update positions
-            for i in 0..self.data.nodes.len() {
+            for i in 0..nodes.len() {
                 velocities[i].x = (velocities[i].x + forces[i].x) * damping;
                 velocities[i].y = (velocities[i].y + forces[i].y) * damping;
                 
@@ -678,7 +712,12 @@ impl ModDepGraphApp {
 impl eframe::App for ModDepGraphApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Check for messages from the background thread
-        while let Ok(message) = self.data.rx.try_recv() {
+        let message_result = { 
+            // Create a new scope for the lock to ensure it's dropped before we use self mutably
+            self.data.rx.lock().unwrap().try_recv()
+        };
+        
+        if let Ok(message) = message_result {
             match message {
                 AppMessage::ModsLoaded(mods, icons) => {
                     self.data.mods = mods;
@@ -829,9 +868,9 @@ impl eframe::App for ModDepGraphApp {
 
             if ui.input(|i| i.key_pressed(Key::Space)) {
                 // Toggle selected node's position to be fixed/unfixed
-                if let Some(node_idx) = self.data.drag_node {
+                if let Some(_node_idx) = self.data.drag_node {
                     // Toggle fixed state (would need to add a 'fixed' field to Node struct)
-                    // self.data.nodes[node_idx].fixed = !self.data.nodes[node_idx].fixed;
+                    // self.data.nodes[_node_idx].fixed = !self.data.nodes[_node_idx].fixed;
                 }
             }
 
@@ -884,7 +923,7 @@ impl eframe::App for ModDepGraphApp {
             }
             
             // Draw edges first (so they appear behind nodes)
-            for (edge_idx, edge) in self.data.edges.iter().enumerate() {
+            for (_edge_idx, edge) in self.data.edges.iter().enumerate() {
                 let from_idx = self.data.nodes.iter().position(|n| n.id == edge.from);
                 let to_idx = self.data.nodes.iter().position(|n| n.id == edge.to);
                 
@@ -1114,10 +1153,8 @@ impl eframe::App for ModDepGraphApp {
 }
 
 fn scan_mods(mods_path: &Path, tx: Sender<AppMessage>) -> Result<(Vec<(String, ModFormat)>, Vec<ModIcon>)> {
-    let mut results = Vec::new();
-    let mut icons = Vec::new();
-    
-    let total_files = WalkDir::new(mods_path)
+    // First, collect all JAR files in parallel
+    let jar_files: Vec<PathBuf> = WalkDir::new(mods_path)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| {
@@ -1129,59 +1166,57 @@ fn scan_mods(mods_path: &Path, tx: Sender<AppMessage>) -> Result<(Vec<(String, M
             }
             path.extension().map_or(false, |ext| ext == "jar")
         })
-        .count();
+        .map(|e| e.path().to_owned())
+        .collect();
     
-    let mut processed = 0;
+    let total_files = jar_files.len();
+    tx.send(AppMessage::Progress(format!("Found {} mod files", total_files))).unwrap();
     
-    for entry in WalkDir::new(mods_path)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| {
-            let path = e.path();
-            // Filter out .connector and .index folders
-            if path.is_dir() {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                return name != ".connector" && name != ".index";
+    // Process all JARs in parallel using Rayon
+    let chunk_size = (total_files / 8).max(1); // Adjust chunk size based on number of files
+    let results: Vec<(Option<(String, ModFormat)>, Option<ModIcon>)> = jar_files.par_chunks(chunk_size)
+        .flat_map(|chunk| {
+            let mut chunk_results = Vec::new();
+            
+            for path in chunk {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                match extract_mod_info_and_icon(path) {
+                    Ok(result) => {
+                        chunk_results.push(result);
+                    }
+                    Err(e) => {
+                        println!("Error processing {}: {}", file_name, e);
+                        // Errors are logged but don't stop processing
+                    }
+                }
             }
-            true
-        }) {
-        let path = entry.path();
+            
+            chunk_results
+        })
+        .collect();
+    
+    // Update progress periodically
+    let processed = results.len();
+    tx.send(AppMessage::Progress(format!("Processed {}/{} mods", processed, total_files))).unwrap();
+    
+    // Split the results into mods and icons
+    let mut mods = Vec::new();
+    let mut icons = Vec::new();
+    
+    for (mod_info, icon) in results {
+        if let Some((jar_name, mod_format)) = mod_info {
+            mods.push((jar_name, mod_format));
+        }
         
-        // Only process JAR files
-        if path.extension().map_or(false, |ext| ext == "jar") {
-            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-            tx.send(AppMessage::Progress(format!("Processing: {} ({}/{})", 
-                file_name, processed + 1, total_files))).unwrap();
-            
-            match extract_mod_info_and_icon(path) {
-                Ok((Some((jar_name, mod_format)), Some(icon))) => {
-                    results.push((jar_name, mod_format));
-                    icons.push(icon);
-                }
-                Ok((Some((jar_name, mod_format)), None)) => {
-                    results.push((jar_name, mod_format));
-                }
-                Ok((None, Some(icon))) => {
-                    icons.push(icon);
-                }
-                Ok((None, None)) => {
-                    // No mod info found - skip silently
-                }
-                Err(e) => {
-                    tx.send(AppMessage::Progress(format!("Error processing {}: {}", file_name, e))).unwrap();
-                }
-            }
-            
-            processed += 1;
-            if processed % 10 == 0 || processed == total_files {
-                tx.send(AppMessage::Progress(format!(
-                    "Processed {}/{} mods", processed, total_files
-                ))).unwrap();
-            }
+        if let Some(mod_icon) = icon {
+            icons.push(mod_icon);
         }
     }
     
-    Ok((results, icons))
+    tx.send(AppMessage::Progress(format!("Found {} mods with metadata and {} icons", 
+        mods.len(), icons.len()))).unwrap();
+    
+    Ok((mods, icons))
 }
 
 fn extract_mod_info_and_icon(jar_path: &Path) -> Result<(Option<(String, ModFormat)>, Option<ModIcon>)> {
@@ -1364,144 +1399,132 @@ fn generate_dependency_graph(mods: &[(String, ModFormat)]) -> Result<DiGraph<Str
     let mut node_map = HashMap::new();
     let mut mod_id_to_jar = HashMap::new();
     let mut mod_environments = HashMap::new();
-    let mut edge_info = Vec::new();
     
-    // First pass: create nodes for each mod
+    // First, extract all mod IDs and environment info in parallel
+    let mod_info: Vec<(String, String, Option<String>)> = mods.par_iter()
+        .flat_map(|(_jar_name, mod_format)| {
+            match mod_format {
+                ModFormat::NeoForge(neoforge) => {
+                    neoforge.mods.iter().map(|mod_entry| {
+                        let display_name = if mod_entry.display_name.is_empty() {
+                            format!("{} ({})", mod_entry.mod_id, mod_entry.version)
+                        } else {
+                            format!("{} ({})", mod_entry.display_name, mod_entry.version)
+                        };
+                        (mod_entry.mod_id.clone(), display_name, None)
+                    }).collect::<Vec<_>>()
+                },
+                ModFormat::Fabric(fabric) => {
+                    let display_name = if let Some(name) = &fabric.name {
+                        format!("{} ({})", name, fabric.version)
+                    } else {
+                        format!("{} ({})", fabric.id, fabric.version)
+                    };
+                    vec![(fabric.id.clone(), display_name, fabric.environment.clone())]
+                }
+            }
+        })
+        .collect();
+    
+    // Create nodes in the graph
+    for (mod_id, display_name, environment) in mod_info {
+        let node_idx = graph.add_node(display_name);
+        node_map.insert(mod_id.clone(), node_idx);
+        
+        // Store environment info if available
+        if let Some(env) = environment {
+            mod_environments.insert(mod_id.clone(), env);
+        }
+    }
+    
+    // Store jar names for each mod ID
     for (jar_name, mod_format) in mods {
         match mod_format {
             ModFormat::NeoForge(neoforge) => {
                 for mod_entry in &neoforge.mods {
-                    let display_name = if mod_entry.display_name.is_empty() {
-                        format!("{} ({})", mod_entry.mod_id, mod_entry.version)
-                    } else {
-                        format!("{} ({})", mod_entry.display_name, mod_entry.version)
-                    };
-                    
-                    let node_idx = graph.add_node(display_name);
-                    node_map.insert(mod_entry.mod_id.clone(), node_idx);
                     mod_id_to_jar.insert(mod_entry.mod_id.clone(), jar_name.clone());
                 }
             },
             ModFormat::Fabric(fabric) => {
-                let display_name = if let Some(name) = &fabric.name {
-                    format!("{} ({})", name, fabric.version)
-                } else {
-                    format!("{} ({})", fabric.id, fabric.version)
-                };
-                
-                let node_idx = graph.add_node(display_name);
-                node_map.insert(fabric.id.clone(), node_idx);
                 mod_id_to_jar.insert(fabric.id.clone(), jar_name.clone());
-                
-                // Store environment info
-                if let Some(env) = &fabric.environment {
-                    mod_environments.insert(fabric.id.clone(), env.clone());
-                }
             }
         }
     }
     
-    // Debug output to find issues
     println!("Created {} nodes in graph", graph.node_count());
     
-    // Second pass: add edges for dependencies
-    for (_, mod_format) in mods {
-        match mod_format {
-            ModFormat::NeoForge(neoforge) => {
-                for (base_mod_id, dependencies) in &neoforge.dependencies {
-                    if let Some(from_idx) = node_map.get(base_mod_id) {
+    // Extract all dependencies in parallel
+    let all_dependencies: Vec<(String, String, String, Option<String>)> = mods.par_iter()
+        .flat_map(|(_jar_name, mod_format)| {
+            let mut deps = Vec::new();
+            
+            match mod_format {
+                ModFormat::NeoForge(neoforge) => {
+                    for (base_mod_id, dependencies) in &neoforge.dependencies {
                         for dep in dependencies {
-                            if let Some(to_idx) = node_map.get(&dep.mod_id) {
-                                let edge_label = format!("{}", dep.dependency_type);
-                                let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                                
-                                // Store edge with side information
-                                edge_info.push((edge_idx, dep.side.clone()));
-                            }
+                            deps.push((
+                                base_mod_id.clone(),
+                                dep.mod_id.clone(),
+                                dep.dependency_type.clone(),
+                                dep.side.clone()
+                            ));
                         }
                     }
-                }
-            },
-            ModFormat::Fabric(fabric) => {
-                if let Some(from_idx) = node_map.get(&fabric.id) {
-                    // Get environment for this mod
+                },
+                ModFormat::Fabric(fabric) => {
                     let env = fabric.environment.as_ref().map(|e| e.as_str()).unwrap_or("*");
                     
-                    // Add required dependencies
+                    // Required dependencies
                     for (dep_id, _) in &fabric.depends {
-                        if let Some(to_idx) = node_map.get(dep_id) {
-                            let edge_label = "required".to_string();
-                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                            
-                            // Get dependency environment
-                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
-                            let side = determine_side_from_environments(env, dep_env);
-                            
-                            edge_info.push((edge_idx, Some(side)));
-                        }
+                        let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                        let side = determine_side_from_environments(env, dep_env);
+                        deps.push((fabric.id.clone(), dep_id.clone(), "required".to_string(), Some(side)));
                     }
                     
-                    // Add recommended dependencies
+                    // Recommended dependencies
                     for (dep_id, _) in &fabric.recommends {
-                        if let Some(to_idx) = node_map.get(dep_id) {
-                            let edge_label = "recommends".to_string();
-                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                            
-                            // Get dependency environment
-                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
-                            let side = determine_side_from_environments(env, dep_env);
-                            
-                            edge_info.push((edge_idx, Some(side)));
-                        }
+                        let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                        let side = determine_side_from_environments(env, dep_env);
+                        deps.push((fabric.id.clone(), dep_id.clone(), "recommends".to_string(), Some(side)));
                     }
                     
-                    // Add optional dependencies
+                    // Optional dependencies
                     for (dep_id, _) in &fabric.suggests {
-                        if let Some(to_idx) = node_map.get(dep_id) {
-                            let edge_label = "suggests".to_string();
-                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                            
-                            // Get dependency environment
-                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
-                            let side = determine_side_from_environments(env, dep_env);
-                            
-                            edge_info.push((edge_idx, Some(side)));
-                        }
+                        let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                        let side = determine_side_from_environments(env, dep_env);
+                        deps.push((fabric.id.clone(), dep_id.clone(), "suggests".to_string(), Some(side)));
                     }
                     
-                    // Add conflicts
+                    // Conflicts
                     for (dep_id, _) in &fabric.conflicts {
-                        if let Some(to_idx) = node_map.get(dep_id) {
-                            let edge_label = "conflicts".to_string();
-                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                            
-                            // Get dependency environment
-                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
-                            let side = determine_side_from_environments(env, dep_env);
-                            
-                            edge_info.push((edge_idx, Some(side)));
-                        }
+                        let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                        let side = determine_side_from_environments(env, dep_env);
+                        deps.push((fabric.id.clone(), dep_id.clone(), "conflicts".to_string(), Some(side)));
                     }
                     
-                    // Add breaks
+                    // Breaks
                     for (dep_id, _) in &fabric.breaks {
-                        if let Some(to_idx) = node_map.get(dep_id) {
-                            let edge_label = "breaks".to_string();
-                            let edge_idx = graph.add_edge(*from_idx, *to_idx, edge_label);
-                            
-                            // Get dependency environment
-                            let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
-                            let side = determine_side_from_environments(env, dep_env);
-                            
-                            edge_info.push((edge_idx, Some(side)));
-                        }
+                        let dep_env = mod_environments.get(dep_id).map(|e| e.as_str()).unwrap_or("*");
+                        let side = determine_side_from_environments(env, dep_env);
+                        deps.push((fabric.id.clone(), dep_id.clone(), "breaks".to_string(), Some(side)));
                     }
                 }
             }
+            
+            deps
+        })
+        .collect();
+    
+    // Add edges to the graph
+    let mut edge_count = 0;
+    for (from_mod_id, to_mod_id, edge_type, _side) in all_dependencies {
+        if let (Some(from_idx), Some(to_idx)) = (node_map.get(&from_mod_id), node_map.get(&to_mod_id)) {
+            graph.add_edge(*from_idx, *to_idx, edge_type);
+            edge_count += 1;
         }
     }
     
-    println!("Added {} edges in graph with {} edge info entries", graph.edge_count(), edge_info.len());
+    println!("Added {} edges in graph", edge_count);
     
     // If no edges were found, add all nodes as isolated nodes
     if graph.edge_count() == 0 && graph.node_count() > 0 {
@@ -1540,6 +1563,12 @@ fn load_image_from_memory(image_data: &[u8]) -> Result<DynamicImage> {
 }
 
 fn main() -> Result<()> {
+    // Initialize Rayon thread pool with optimal number of threads
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build_global()
+        .unwrap();
+    
     let args = Args::parse();
     
     println!("Starting mod dependency graph for directory: {:?}", args.mods_path);

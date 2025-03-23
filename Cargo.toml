@@ -18,6 +18,7 @@ egui_extras = "0.23"
 rand = "0.8"
 image = "0.24"
 rayon = "1.7"
+num_cpus = "1.16"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "windef"] }
