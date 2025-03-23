@@ -1,0 +1,22 @@
+[package]
+name = "modsdepgraph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = "0.6"
+walkdir = "2.4"
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+petgraph = { version = "0.6", features = ["graphmap", "stable_graph"] }
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+eframe = "0.23"
+egui = "0.23"
+egui_extras = "0.23"
+rand = "0.8"
+image = "0.24"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "windef"] }
